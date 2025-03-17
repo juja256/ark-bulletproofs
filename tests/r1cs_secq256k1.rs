@@ -1,11 +1,16 @@
 #![allow(non_snake_case)]
 
+
+use std::ops::{Add, Mul};
+
 use ark_bulletproofs::{r1cs::*, BulletproofGens, PedersenGens};
-use ark_ff::UniformRand;
+use ark_ec::{short_weierstrass::SWCurveConfig, AffineRepr, CurveGroup};
+use ark_ff::{BigInteger, Field, PrimeField, UniformRand};
 use ark_secq256k1::{Affine, Fr};
 use ark_std::rand::seq::SliceRandom;
 use ark_std::rand::thread_rng;
 use ark_std::One;
+use digest::crypto_common::{KeyInit, KeyIvInit};
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 
@@ -214,6 +219,203 @@ fn shuffle_gadget_test_42() {
     kshuffle_helper(42);
 }
 
+fn u64_from_scalar(x: Fr) -> u64 {
+    let b = x.0.to_bytes_le();
+    let u64_len = u64::BITS as usize / 8;
+    if b[u64_len..].iter().any(|bi| *bi != 0) {
+        panic!("Input is too large");
+    }
+
+    lakey_acc(&b[..u64_len], 1u64 << u8::BITS)
+}
+
+pub fn lakey_acc<
+    U: Clone,
+    V: Clone + Mul<Output = V>,
+    T: From<U> + Add<Output = T> + Mul<V, Output = T> + Default + Clone,
+>(
+    x: &[U],
+    base: V,
+) -> T {
+    let (head, tail) = (&x[0], &x[1..]);
+    let init = T::from(head.clone());
+    let mut a = base.clone();
+    tail.iter().enumerate().fold(init, |acc, (i, xi)| {
+        let acc = acc + T::from(xi.clone()) * a.clone();
+        // Skip to prevent overflow.
+        if i != tail.len() - 1 {
+            a = a.clone() * base.clone();
+        }
+        acc
+    })
+}
+
+fn bin_equality_gadget<CS: ConstraintSystem<Fr>>(
+    cs: &mut CS,
+    x: &LinearCombination<Fr>,
+    x_val: Option<Fr>,
+) -> Result<Vec<Variable<Fr>>, R1CSError> {
+    let x_bits: Vec<Variable<Fr>> = (0..Fr::MODULUS_BIT_SIZE as usize)
+        .map(|i| {
+            // Create low-level variables and add them to constraints
+            let (a, b, o) = cs.allocate_multiplier(x_val.as_ref().map(|q| {
+                let bit = q.0.get_bit(i) as i32;
+                ((1 - bit).into(), bit.into())
+            }))?;
+
+            // Enforce a * b = 0, so one of (a,b) is zero
+            cs.constrain(o.into());
+
+            // Enforce that a = 1 - b, so they both are 1 or 0.
+            cs.constrain(a + (b - Fr::from(1u64)));
+
+            Ok(b)
+        })
+        .collect::<Result<_, R1CSError>>()?;
+
+    // Enforce that x = Sum(b_i * 2^i, i = 0..n-1)
+    let x_acc: LinearCombination<Fr> = lakey_acc(&x_bits, Fr::from(2u64));
+    cs.constrain(x.clone() - x_acc);
+
+    Ok(x_bits)
+}
+
+// sketch1: Q_a=[λ_a]P1 ∈ G1, Com((λ_a, r), (Q_b, H2)) = [λ_a]Q_b + [r]H2 ∈ G2, λ_ab=x([λ_a]Q_b), Com((λ_ab, t), (P1, H1)), Q_ab=[λ_ab]P2
+// sketch2: Com((λ_a, r), (P1, H1)) ∈ G1, check if DL equal across Com, Q_a; Q_b, Q_ab ∈ G2: compute λ_ab=x([λ_a]Q_B) => check Q_ab==[λ_ab]P2
+// we use https://eprint.iacr.org/2022/1593.pdf to prove that λ_a is equal across G1, G2 (generalization of Chaum-Pedersen proto (G1=G2))
+
+// proof of x(Q_ab) = x([λ_a]Q_b), idea from https://eprint.iacr.org/2024/397.pdf
+fn dh_gadget<CS: ConstraintSystem<Fr>>(
+    cs: &mut CS,
+    λ_a: Option<Fr>,
+    Q_b: ark_secp256k1::Affine,
+    var_a: Variable<Fr>,
+    var_ab: Variable<Fr>,
+) -> Result<(), R1CSError> {
+
+    let (w_a, w_b) = (Fr::from(0), Fr::from(7));
+    let l = (Fr::MODULUS_BIT_SIZE-1) as i32;
+    let Δ1: Vec<_> = (0..l).map(|i| if i == (l-1) {
+        (ark_secp256k1::Config::GENERATOR*ark_secp256k1::Fr::from(-(l*l+3*l)/2)).into_affine()
+    } else {
+        (ark_secp256k1::Config::GENERATOR*ark_secp256k1::Fr::from(i+2)).into_affine()
+    }).collect();
+    let mut δ = vec![Q_b];
+    for i in (1..l as usize) {
+        δ.push(((*δ.last().unwrap())*ark_secp256k1::Fr::from(2)).into_affine());
+    }
+    let Δ2: Vec<_> = Δ1.iter().zip(δ.iter()).map(|(x, y)| (*x+y).into_affine()).collect();
+
+    let k_vars = bin_equality_gadget(cs, &LinearCombination::from(var_a), λ_a)?;
+
+    // P_0 = Δ_0
+    let (_, _, x0) = cs.multiply(k_vars[0] * *δ[0].x().unwrap() + *Δ1[0].x().unwrap(), Variable::One().into()); // x0 = k[0]*(x-x')+x'
+    let (_, _, y0) = cs.multiply(k_vars[0] * *δ[0].y().unwrap() + *Δ1[0].y().unwrap(), Variable::One().into()); // y0 = k[0]*(y-y')+y'
+    let mut P  = λ_a.map(|v| vec![ (Q_b * ark_secp256k1::Fr::from(v.0.get_bit(0) as u64) + Δ1[0] ).into_affine() ] );
+    let mut P_vars = vec![(x0, y0)];
+
+    for i in 1..l as usize {
+        // calculate witness P_i = P_i_1 + Δ_i
+        let P_i = if let Some(λ_a) = λ_a {
+            let P_i = (*(P.as_ref().unwrap().last().unwrap()) + match λ_a.0.get_bit(i) {
+                true => Δ2[i],
+                false => Δ1[i]
+            }).into_affine();
+            P.as_mut().unwrap().push( P_i );
+            Some(P_i)
+        } else { None };
+        // calculate Delta
+        let (Δ_i_x, Δ_i_y) = (k_vars[i] * *δ[i].x().unwrap() + *Δ1[i].x().unwrap(), k_vars[i] * *δ[i].y().unwrap() + *Δ1[i].y().unwrap() );
+        
+        let (_, x_P, x_P2) = cs.allocate_multiplier(P_i.map(|P_i| (*P_i.x().unwrap(), *P_i.x().unwrap())))?;
+        let (_, y_P, y_P2) = cs.allocate_multiplier(P_i.map(|P_i| (*P_i.y().unwrap(), *P_i.y().unwrap())))?;
+        let (_, _, x_P3) = cs.multiply(x_P2.into(), x_P.into());
+        let (P_i_1_x, P_i_1_y) = *P_vars.last().unwrap();
+        P_vars.push((x_P, y_P));
+        
+        // check curve equation for current points
+        let curve_eq = y_P2 - x_P3 - x_P*w_a - w_b;
+        cs.constrain(curve_eq);
+
+        // check that Δ_i, -P_i, P_i_1 is on the same line
+        let (_, _, t1) = cs.multiply(P_i_1_y + y_P, Δ_i_x - x_P);
+        let (_, _, t2) = cs.multiply(Δ_i_y + y_P, P_i_1_x - x_P);
+        cs.constrain(t1-t2);
+    }
+
+    // final check of x coordinate
+    cs.constrain(var_ab - P_vars.last().unwrap().0 );
+    Ok(())
+}
+
+fn dh_gadget_proof(
+    pc_gens: &PedersenGens<Affine>,
+    bp_gens: &BulletproofGens<Affine>,
+    Q_b: ark_secp256k1::Affine,
+
+    λ_a: Fr,
+    λ_ab: Fr,
+) -> Result<(R1CSProof<Affine>, (Affine, Affine)), R1CSError> {
+    let mut blinding_rng = rand::thread_rng();
+
+    let mut transcript = Transcript::new(b"ARTGadget");
+
+    // 1. Create a prover
+    let mut prover = Prover::new(pc_gens, &mut transcript);
+
+    // 2. Commit high-level variables
+    let (a_commitment, var_a) = prover.commit(λ_a, Fr::rand(&mut blinding_rng));
+    let (ab_commitment, var_ab) = prover.commit(λ_ab, Fr::rand(&mut blinding_rng));
+
+    dh_gadget(&mut prover, Some(λ_a), Q_b, var_a, var_ab)?;
+    let circuit_len = prover.multipliers_len();
+    let proof = prover.prove(&mut blinding_rng, bp_gens)?;
+    println!("{:?} {:?}", circuit_len, proof);
+
+    Ok((proof, (a_commitment, ab_commitment)))
+}
+
+fn dh_gadget_verify(
+    pc_gens: &PedersenGens<Affine>,
+    bp_gens: &BulletproofGens<Affine>,
+    proof: R1CSProof<Affine>,
+    Q_b: ark_secp256k1::Affine,
+
+    a_commitment: Affine,
+    ab_commitment: Affine,
+) -> Result<(), R1CSError> {
+    let mut transcript = Transcript::new(b"ARTGadget");
+    let mut verifier = Verifier::new(&mut transcript);
+    let var_a = verifier.commit(a_commitment);
+    let var_ab = verifier.commit(ab_commitment);
+
+    dh_gadget(&mut verifier, None, Q_b, var_a, var_ab)?;
+
+    verifier
+        .verify(&proof, &pc_gens, &bp_gens)
+        .map_err(|_| R1CSError::VerificationError)
+}
+
+fn dh_gadget_roundtrip() -> Result<(), R1CSError> {
+    let mut blinding_rng = rand::thread_rng();
+    let pc_gens = PedersenGens::default();
+    let bp_gens = BulletproofGens::new(128, 1);
+    let Q_b = ark_secp256k1::Affine::rand(&mut blinding_rng);
+    let λ_a = -42;
+
+    let R = (Q_b * ark_secp256k1::Fr::from(λ_a)).into_affine();
+    
+    let (proof, (var_a, var_b)) = dh_gadget_proof(&pc_gens, &bp_gens, Q_b, Fr::from(λ_a), Fr::from(R.x().unwrap().0))?;
+
+    dh_gadget_verify(&pc_gens, &bp_gens, proof, Q_b, var_a, var_b)
+}
+
+#[test]
+fn dh_gadget_roundtrip_test() {
+    assert!(dh_gadget_roundtrip().is_ok());
+
+}
+
 /// Constrains (a1 + a2) * (b1 + b2) = (c1 + c2)
 fn example_gadget<CS: ConstraintSystem<Fr>>(
     cs: &mut CS,
@@ -311,7 +513,7 @@ fn example_gadget_roundtrip_helper(
 ) -> Result<(), R1CSError> {
     // Common
     let pc_gens = PedersenGens::default();
-    let bp_gens = BulletproofGens::new(128, 1);
+    let bp_gens = BulletproofGens::new(4096, 1);
 
     let (proof, commitments) = example_gadget_proof(&pc_gens, &bp_gens, a1, a2, b1, b2, c1, c2)?;
 
