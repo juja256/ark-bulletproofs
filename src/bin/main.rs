@@ -14,6 +14,7 @@ use ark_std::One;
 use digest::crypto_common::{KeyInit, KeyIvInit};
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
+use tracing::{debug, info, instrument};
 
 pub fn lakey_acc<
     U: Clone,
@@ -80,7 +81,6 @@ fn dh_gadget<CS: ConstraintSystem<G1::Fr>>(
     var_a: Variable<G1::Fr>,
     var_ab: Variable<G1::Fr>,
 ) -> Result<(), R1CSError> {
-    
     let (w_a, w_b) = (G1::Fr::from(0), G1::Fr::from(7));
     let l = (G1::Fr::MODULUS_BIT_SIZE) as i32;
     let Δ1: Vec<_> = (0..l).map(|i| if i == (l-1) {
@@ -88,25 +88,19 @@ fn dh_gadget<CS: ConstraintSystem<G1::Fr>>(
     } else {
         (G2::Config::GENERATOR*G2::Fr::from(i+2)).into_affine()
     }).collect();
-    let f = Δ1.iter().fold(G2::Affine::identity(), |x, a| (x + a).into_affine() );
-    //println!("l = {l}, f = {:?}", f);
+
     let mut δ = vec![Q_b];
-    for i in (1..l as usize) {
+    for _ in 1..l as usize {
         δ.push(((*δ.last().unwrap())*G2::Fr::from(2)).into_affine());
     }
     let Δ2: Vec<_> = Δ1.iter().zip(δ.iter()).map(|(x, y)| (*x+y).into_affine()).collect();
-    let f1 = Δ2.iter().fold(G2::Affine::identity(), |x, a| (x + a).into_affine() );
-    let f2 = δ.iter().fold(G2::Affine::identity(), |x, a| (x + a).into_affine() );
-    //println!("f_δ = {:?}, f_Δ2 = {:?}", f2, f1);
     let k_vars = bin_equality_gadget(cs, &LinearCombination::from(var_a), λ_a)?;
     let λ_a = λ_a.map(|x| x.into_bigint());
     
     // P_0 = Δ_0
-    // *Δ1[0].x().unwrap() + k_vars[0] * (*Δ2[0].x().unwrap() - *Δ1[0].x().unwrap())
     let (_, _, x0) = cs.multiply( Variable::One() * *Δ1[0].x().unwrap() + k_vars[0] * (*Δ2[0].x().unwrap() - *Δ1[0].x().unwrap()), Variable::One().into()); // x0 = k[0]*(x-x')+x'
     let (_, _, y0) = cs.multiply(Variable::One() * *Δ1[0].y().unwrap() + k_vars[0] * (*Δ2[0].y().unwrap() - *Δ1[0].y().unwrap()), Variable::One().into()); // y0 = k[0]*(y-y')+y'
     let mut P  = λ_a.map(|λ_a| vec![ (Q_b * G2::Fr::from(λ_a.get_bit(0) as u64) + Δ1[0] ).into_affine() ] );
-    
     let mut P_vars = vec![(x0, y0)];
     
     for i in 1..l as usize {
@@ -125,16 +119,6 @@ fn dh_gadget<CS: ConstraintSystem<G1::Fr>>(
             Variable::One() * *Δ1[i].y().unwrap() + k_vars[i] * (*Δ2[i].y().unwrap() - *Δ1[i].y().unwrap())
         );
 
-        // calculate Delta
-        let P0 = λ_a.map(|λ_a| (G2::Fq::from(λ_a.get_bit(0) as u64) * *δ[0].x().unwrap() + *Δ1[0].x().unwrap(), G2::Fq::from(λ_a.get_bit(0) as u64) * *δ[0].y().unwrap() + *Δ1[0].y().unwrap()) );
-        //println!("P0 = {:?}, P = {:?}", P0, P.as_ref().map(|P| P.into_iter().map(|Q| (Q.x().unwrap(), Q.y().unwrap())).collect::<Vec<_>>() ) ) ;
-        
-
-        let delta = λ_a.map(|λ_a| ( G2::Fq::from(λ_a.get_bit(i) as u64) * *δ[i].x().unwrap() + *Δ1[i].x().unwrap(), G2::Fq::from(λ_a.get_bit(i) as u64) * *δ[i].y().unwrap() + *Δ1[i].y().unwrap() ));
-        let t1 = P.as_ref().map(|P| { ( P[i-1].y().unwrap() + P[i].y().unwrap() ) * (delta.unwrap().0 - P[i].x().unwrap() ) });
-        let t2 = P.as_ref().map(|P| { ( delta.unwrap().1 + P[i].y().unwrap() ) * (P[i-1].x().unwrap() - P[i].x().unwrap() ) });
-        //println!("Δ_{i} = {:?}, t1 = {:?}, t2 = {:?}", delta, t1, t2);
-
         let (_, x_P, x_P2) = cs.allocate_multiplier(P_i.map(|P_i| (*P_i.x().unwrap(), *P_i.x().unwrap())))?;
         let (_, y_P, y_P2) = cs.allocate_multiplier(P_i.map(|P_i| (*P_i.y().unwrap(), *P_i.y().unwrap())))?;
         let (_, _, x_P3) = cs.multiply(x_P2.into(), x_P.into());
@@ -150,14 +134,14 @@ fn dh_gadget<CS: ConstraintSystem<G1::Fr>>(
         let (_, _, t2) = cs.multiply(Δ_i_y + y_P, P_i_1_x - x_P);
         cs.constrain(t1-t2);
     }
-    println!("P_final = {:?}", P.as_ref().map(|P| P.iter().last().clone() ));
+    info!("P_final = {:?}", P.as_ref().map(|P| P.iter().last().clone() ));
     // final check of x coordinate
     cs.constrain(var_ab - P_vars.last().unwrap().0 );
-
     
     Ok(())
 }
 
+#[instrument(skip(pc_gens, bp_gens, Q_b, λ_a, λ_ab))]
 fn dh_gadget_proof(
     pc_gens: &PedersenGens<G1::Affine>,
     bp_gens: &BulletproofGens<G1::Affine>,
@@ -181,11 +165,12 @@ fn dh_gadget_proof(
     let circuit_len = prover.multipliers_len();
 
     let proof = prover.prove(&mut blinding_rng, bp_gens)?;
-    println!("circuit_size = {:?}, proof_size = {:?}", circuit_len, proof.to_bytes()?.len() );
+    info!("ARTGadget proved: circuit_size = {:?}, proof_size = {:?}", circuit_len, proof.to_bytes()?.len() );
 
     Ok((proof, (a_commitment, ab_commitment)))
 }
 
+#[instrument(skip(pc_gens, bp_gens, proof, a_commitment, ab_commitment))]
 fn dh_gadget_verify(
     pc_gens: &PedersenGens<G1::Affine>,
     bp_gens: &BulletproofGens<G1::Affine>,
@@ -216,7 +201,7 @@ fn dh_gadget_roundtrip() -> Result<(), R1CSError> {
     let λ_a = BigInt::new([(1u64<<62) + 5, 1, 1, (1u64<<62) + 5]);
     
     let R = (Q_b * G2::Fr::from(λ_a)).into_affine();
-    println!("R_real={:?}", R);
+    info!("R_real={:?}", R);
     
     let (proof, (var_a, var_b)) = dh_gadget_proof(&pc_gens, &bp_gens, Q_b, G1::Fr::from(λ_a), G1::Fr::from(*R.x().unwrap()))?;
 
@@ -224,5 +209,15 @@ fn dh_gadget_roundtrip() -> Result<(), R1CSError> {
 }
 
 fn main() {
+    // Використовуємо змінну середовища MY_LOG_LEVEL замість RUST_LOG
+    let log_level = std::env::var("PROOF_LOG").unwrap_or_else(|_| "info".to_string());
+
+    tracing_subscriber::fmt()
+         // Встановлюємо рівень логування з змінної середовища
+         .with_env_filter(log_level)
+         // Додаємо вивід часу (опціонально)
+         .with_target(false)
+         .init();
+
     dh_gadget_roundtrip().unwrap();
 }
